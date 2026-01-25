@@ -1,0 +1,9 @@
+easyocr
+numpy
+pandas
+Pillow
+pydantic
+Requests
+SQLAlchemy
+streamlit
+streamlit_paste_button
