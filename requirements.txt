@@ -7,3 +7,5 @@ Requests
 SQLAlchemy
 streamlit
 streamlit_paste_button
+streamlit-paste-button
+sqlalchemy

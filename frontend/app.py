@@ -4,7 +4,6 @@ from PIL import Image
 import os
 import sys
 import json
-import torch
 import gc
 from datetime import datetime
 
@@ -17,11 +16,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import importlib.util
 from backend.app.services.ocr_service import OCRService
-from backend.app.services.ai_enhancer import AIEnhancerService
-from backend.app.services.ai_local_service import AIEnhancerLocal
-from backend.app.models.finance_model import init_db, SessionLocal, FinancialRecordModel
+from backend.app.models.finance_model import init_db, SessionLocal
 from backend.app.repositories.finance_repo import FinanceRepository
-from shared.schemas.finance import FinancialRecordCreate
 
 # Helper: Load Config
 def load_financial_metrics(config_path):
@@ -35,15 +31,10 @@ init_db()
 
 st.set_page_config(page_title="SketchFinance - 财务数据识录", layout="wide")
 
-# Sidebar - Settings & Config
-st.sidebar.header("⚙️ 系统设置")
-ollama_url = st.sidebar.text_input("Ollama URL", value="http://localhost:11434")
-ollama_model = st.sidebar.text_input("Ollama Model", value="llama3")
-
-st.sidebar.divider()
+# Sidebar - Config Only
 st.sidebar.header("📝 指标配置")
 default_config_path = os.path.join(os.getcwd(), "backend", "config", "config.py")
-uploaded_config = st.sidebar.file_uploader("上传自定义 config.py", type=['py'])
+uploaded_config = st.sidebar.file_uploader("上传自定义 config.py (仅影响数据录入)", type=['py'])
 
 if uploaded_config:
     temp_config_path = "temp_config.py"
@@ -54,29 +45,11 @@ if uploaded_config:
 else:
     FINANCIAL_METRICS = load_financial_metrics(default_config_path)
 
-# Sidebar - Optimization Settings
-st.sidebar.header("⚙️ 性能设置")
-gpu_ocr_enabled = st.sidebar.toggle("⚡ OCR GPU 加速", value=False, help="如果开启本地 AI 模型，建议关闭此项以节省显存")
-
-# Initialize Services with Safety
+# Initialize OCR Service (CPU mode for stability)
 if 'ocr_service' not in st.session_state:
-    try:
-        st.session_state.ocr_service = OCRService(gpu=gpu_ocr_enabled)
-    except Exception as e:
-        st.sidebar.warning(f"GPU OCR 初始化失败: {e}。将回退到 CPU 模式。")
-        st.session_state.ocr_service = OCRService(gpu=False)
-
-st.sidebar.info("提示：如果显卡显存(VRAM)不足导致报错，请保持上面开关处于**关闭**状态。")
-
-if 'ai_enhancer' not in st.session_state:
-    st.session_state.ai_enhancer = AIEnhancerService(ollama_url=ollama_url, model=ollama_model)
-else:
-    st.session_state.ai_enhancer.ollama_url = f"{ollama_url}/api/generate"
-    st.session_state.ai_enhancer.model = ollama_model
+    st.session_state.ocr_service = OCRService(gpu=False)
 
 # Clean memory periodically
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
 gc.collect()
 
 if 'db' not in st.session_state:
@@ -120,8 +93,6 @@ with col_up:
     st.header("2. 上传/粘贴截图模块")
     st.info("提示：您可以直接点击按钮并使用 Ctrl+V 粘贴截图")
     
-    use_local_ai = st.toggle("🚀 使用本地 Transformers 模型深度纠错", value=True, help="启用后将使用本地 0.5B 模型对识别结果进行语义微调")
-
     col_p, col_m, col_v = st.columns(3)
     with col_p:
         st.subheader("📅 季度")
@@ -158,9 +129,7 @@ with col_up:
                             o_img.save(path)
                     paths.append(path)
                 
-                if torch.cuda.is_available():
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                gc.collect()
                 
                 # Perform Multi-Image OCR
                 try:
@@ -174,110 +143,90 @@ with col_up:
                 if extracted_date:
                     st.session_state.auto_disclosure_date = extracted_date
                 
-                # Boost with Local AI if enabled
-                if use_local_ai and parsed_data:
-                    if 'ai_local' not in st.session_state:
-                        with st.status("🧠 正在初始化本地 AI 模型 (可能触发 GPU 内存警告)..."):
-                            try:
-                                gc.collect()
-                                if torch.cuda.is_available(): torch.cuda.empty_cache()
-                                st.session_state.ai_local = AIEnhancerLocal()
-                            except Exception as e:
-                                st.error(f"本地 AI 模型加载失败: {e}。将禁用 AI 增强。")
-                                use_local_ai = False
-                    
-                    with st.spinner("🤖 本地 AI 正在深度校验识别结果..."):
-                        # Convert parsed data back to text for AI to see context
-                        raw_data_str = json.dumps(parsed_data, ensure_ascii=False)
-                        ai_json = st.session_state.ai_local.enhance_ocr_results(raw_data_str, current_metrics)
-                        try:
-                            ai_parsed = json.loads(ai_json)
-                            if ai_parsed:
-                                parsed_data = ai_parsed
-                                st.toast("✅ 本地 AI 已成功校验并优化数据结果", icon="🤖")
-                        except Exception as e:
-                            st.error(f"AI 校验失败: {e}")
                 
                 if parsed_data:
                     for item in parsed_data: item['category'] = selected_category
                     df = pd.DataFrame(parsed_data)
                     df = df.drop_duplicates(subset=['metric_id', 'period'], keep='first')
+                    
+                    # 创建主数据透视表
                     pivot_df = df.pivot(index='metric_id', columns='period', values='value')
                     labels_map = {m['id']: m['label'] for m in FINANCIAL_METRICS}
                     pivot_df.index = pivot_df.index.map(lambda x: labels_map.get(x, x))
+                    
+                    # 提取每季度的截止日期
+                    if 'report_date' in df.columns:
+                        date_df = df.drop_duplicates(subset=['period'])[['period', 'report_date']]
+                        date_dict = dict(zip(date_df['period'], date_df['report_date']))
+                        st.session_state.period_dates = date_dict
+                        
+                        # 创建日期行并添加到透视表
+                        date_row = pd.DataFrame([date_dict], index=['截止日期'])
+                        date_row = date_row.reindex(columns=pivot_df.columns)
+                        pivot_df = pd.concat([date_row, pivot_df])
+                    
                     st.session_state.parsed_df = pivot_df
                     st.session_state.raw_parsed = parsed_data
                     st.success("识别完成!")
                 else:
                     st.error("识别失败，请检查截图。")
 
+
 with col_res:
     st.subheader("📋 识别结果预览与编辑")
     if 'parsed_df' in st.session_state:
+        # 显示披露日期
+        if st.session_state.auto_disclosure_date:
+            st.info(f"📅 识别到的披露日期：**{st.session_state.auto_disclosure_date}**")
+        
         edited_df = st.data_editor(st.session_state.parsed_df, use_container_width=True)
         
         target_ticker = st.text_input("公司代码 (Ticker)", value="NVDA")
+        
+        # 数据库管理选项
+        db_col1, db_col2 = st.columns(2)
+        with db_col1:
+            overwrite_existing = st.checkbox("🔄 覆盖相同日期数据", value=True, 
+                help="勾选后，相同Ticker、年份、期间、类别的数据会被覆盖；否则跳过已存在的记录")
+        with db_col2:
+            if st.button("🗑️ 清空该类别数据"):
+                # 获取将被删除的记录数
+                deleted = st.session_state.repo.delete_by_category(selected_category)
+                st.warning(f"已清空 {deleted} 条{selected_category}数据")
+                st.rerun()
 
-        if st.button("💾 确认并同步到 Wide-Format 数据库"):
-            count = 0
-            # Reverse map for metric labels to IDs
-            metrics_reverse_map = {m['label']: m['id'] for m in FINANCIAL_METRICS}
-            
-            # Group by Period (Column)
-            for period_col in edited_df.columns:
-                p_str = str(period_col)
-                year_val = 2024
-                p_val = p_str
-                if "/" in p_str:
-                    try:
-                        parts = p_str.split("/")
-                        year_val = int(parts[0])
-                        p_val = parts[1]
-                    except: pass
+        if st.button("💾 保存到数据库 (Pivot Format)"):
+            try:
+                # 获取每季度截止日期
+                period_dates = st.session_state.get('period_dates', {})
                 
-                # Prepare wide record dict
-                record_dict = {
-                    "ticker": target_ticker,
-                    "year": year_val,
-                    "period": p_val,
-                    "category": selected_category,
-                    "report_date": st.session_state.auto_disclosure_date
-                }
+                # 调用新的 Pivot 格式保存方法
+                st.session_state.repo.save_pivot_data(
+                    category=selected_category,
+                    ticker=target_ticker,
+                    pivot_df=edited_df,
+                    period_dates=period_dates
+                )
                 
-                # Add metrics
-                for metric_label, row in edited_df.iterrows():
-                    m_id = metrics_reverse_map.get(metric_label, metric_label)
-                    val = row[period_col]
-                    if pd.notna(val) and str(val).strip() != "":
-                        clean_val = str(val).replace("亿", "").replace("%", "").strip()
-                        try: record_dict[m_id] = float(clean_val)
-                        except: pass
-                
-                from shared.schemas.finance import FinancialRecordCreate
-                record_in = FinancialRecordCreate(**record_dict)
-                st.session_state.repo.create_or_update_record(record_in)
-                count += 1
-            
-            st.success(f"已成功同步 {count} 个时间周期的 Wide-Format 数据！")
-            st.rerun()
+                st.success(f"已成功保存 {selected_category} 数据到数据库！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"保存失败: {e}")
     else:
-        st.info("尚未进行识别。请先上传或粘贴截图并点击“开始识别”。")
+        st.info('尚未进行识别。请先上传或粘贴截图并点击开始识别。')
 
-# History View (Wide Format)
+# History View (Pivot Format - Per Category)
 st.divider()
-st.header("📊 数据库已录入数据 (Wide Format)")
-all_records = st.session_state.repo.get_all_records()
-if all_records:
-    history_data = []
-    for r in all_records:
-        r_dict = {c.name: getattr(r, c.name) for c in r.__table__.columns}
-        history_data.append(r_dict)
-    
-    hist_df = pd.DataFrame(history_data)
-    core_cols = ['ticker', 'year', 'period', 'category']
-    metric_cols = [c for c in hist_df.columns if c not in core_cols + ['id']]
-    # Filter out all-NaN metric columns for cleaner display
-    hist_df = hist_df[core_cols + metric_cols].dropna(axis=1, how='all')
-    st.dataframe(hist_df, use_container_width=True)
+st.header("📊 数据库已录入数据")
+
+# 按类别显示数据
+from backend.app.models.finance_model import CATEGORY_MODEL_MAP
+db_categories = list(CATEGORY_MODEL_MAP.keys())
+selected_db_category = st.selectbox("选择要查看的类别", db_categories, key="db_view_category")
+
+db_df = st.session_state.repo.get_pivot_data(selected_db_category)
+if not db_df.empty:
+    st.dataframe(db_df, use_container_width=True)
 else:
-    st.info("暂无数据录入记录。")
+    st.info(f"暂无 {selected_db_category} 数据录入记录。")
+
